@@ -1,0 +1,38 @@
+{
+  "dataset": "bloodmnist",
+  "timestamp": "smoke",
+  "encoders": {
+    "resnet50": {
+      "1": {
+        "logreg": {
+          "C_reg": 1.0
+        },
+        "tim": {
+          "tau": 20.0,
+          "lam": 0.5,
+          "alpha": 1.0
+        },
+        "tim_cond": {
+          "tau": 20.0,
+          "lam": 0.5,
+          "alpha": 1.0
+        }
+      },
+      "5": {
+        "logreg": {
+          "C_reg": 1.0
+        },
+        "tim": {
+          "tau": 20.0,
+          "lam": 0.5,
+          "alpha": 1.0
+        },
+        "tim_cond": {
+          "tau": 20.0,
+          "lam": 0.5,
+          "alpha": 1.0
+        }
+      }
+    }
+  }
+}
