@@ -36,11 +36,13 @@ logger = logging.getLogger(__name__)
 FEATURE_DIR = Path("features")
 CONFIG_DIR = Path("configs")
 
-# Hyperparameter grids (balanced val only — see CLAUDE.md)
-TAU_GRID = [5, 10, 20, 30]
+# Hyperparameter grids (balanced val only — see CLAUDE.md).
+# Widened past the CLAUDE.md grid (tau 50/100, alpha 0.25, C 1000): the first
+# val search picked tau=30, alpha=0.5 and C=100 at the grid edges.
+TAU_GRID = [5, 10, 20, 30, 50, 100]
 LAM_GRID = [0.1, 0.3, 0.5, 1.0, 2.0]
-ALPHA_GRID = [0.5, 1.0]
-C_REG_GRID = [0.01, 0.1, 1.0, 10.0, 100.0]
+ALPHA_GRID = [0.25, 0.5, 1.0]
+C_REG_GRID = [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
 SHOTS_LIST = [1, 5, 10, 20]
 
 
@@ -156,6 +158,7 @@ def main() -> None:
         "smoke": args.smoke,
         "n_val_episodes": n_eps,
         "val_support_base_seed": args.base_seed,
+        "grids": {"tau": TAU_GRID, "lam": LAM_GRID, "alpha": ALPHA_GRID, "C_reg": C_REG_GRID},
         "encoders": {},
     }
 

@@ -81,7 +81,9 @@ Features are L2-normalised (float32) before saving.
 
 ### Hyperparameter Tuning
 - 100 val episodes per (encoder, shots); balanced queries only.
-- Grids: τ ∈ {5,10,20,30}, λ ∈ {0.1,0.3,0.5,1,2}, α ∈ {0.5,1}, logreg C as above.
+- Grids: τ ∈ {5,10,20,30,50,100}, λ ∈ {0.1,0.3,0.5,1,2}, α ∈ {0.25,0.5,1}, logreg C ∈ {0.01,…,1000}.
+  Widened from the planned grid (τ ≤ 30, α ≥ 0.5, C ≤ 100) because the first val search picked
+  edge values in nearly every setting. Still val-only; the grid used is stored in `best_hparams.json`.
 - Frozen in `configs/best_hparams.json` before any test evaluation.
 - Hyperparameters tuned on balanced val are used for all imbalance levels (realistic deployment).
 
