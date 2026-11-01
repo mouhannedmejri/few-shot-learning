@@ -170,10 +170,48 @@ class TestSampler:
         ep0 = make_ep(imbalance=1.0, episode_id=0)
         ep1 = make_ep(imbalance=1.0, episode_id=1)
         # Different episodes should (almost certainly) have different class distributions
-        counts0 = np.bincount(ep0.query_y, minlength=4)
-        counts1 = np.bincount(ep1.query_y, minlength=4)
-        # They might occasionally be the same but very unlikely
-        assert not np.array_equal(counts0, counts1) or True  # non-fatal check
+        counts = {
+            tuple(np.bincount(make_ep(imbalance=1.0, episode_id=i).query_y, minlength=4))
+            for i in range(10)
+        }
+        assert len(counts) > 1, "Dirichlet query counts identical across 10 episodes"
+        assert ep0.query_y.shape == ep1.query_y.shape
+
+    def test_query_independent_of_shots(self):
+        """Same episode_id and imbalance => same query set for every K."""
+        for imb in (0.0, 1.0, 0.3):
+            q = [make_ep(shots=k, imbalance=imb, episode_id=5).query_indices for k in (1, 5, 20)]
+            np.testing.assert_array_equal(q[0], q[1])
+            np.testing.assert_array_equal(q[0], q[2])
+
+    def test_methods_do_not_shift_rng_stream(self):
+        """Evaluating methods between samples must not change later episodes."""
+        plain = [make_ep(imbalance=1.0, episode_id=i, support_seed=i) for i in range(4)]
+        mixed = []
+        for i in range(4):
+            ep = make_ep(imbalance=1.0, episode_id=i, support_seed=i)
+            mixed.append(ep)
+            np.random.seed(i)  # perturb global RNGs too
+            for predict in (predict_proto, predict_logreg, predict_tim, predict_tim_cond,
+                            predict_random, predict_majority):
+                predict(ep)
+        for a, b in zip(plain, mixed):
+            np.testing.assert_array_equal(a.pool_indices, b.pool_indices)
+            np.testing.assert_array_equal(a.query_indices, b.query_indices)
+
+    def test_replacement_fallback_counted(self):
+        """A class with fewer query images than requested is drawn with replacement and counted."""
+        pool_X, pool_y = make_pool(n_classes=4)
+        query_X, query_y = make_query(n_classes=4, n_per_class=5)  # 5 < 30 per class
+        ep = sample_episode(
+            pool_X=pool_X, pool_y=pool_y, query_X=query_X, query_y=query_y,
+            n_classes=4, shots=1, n_query_total=120,
+            episode_id=0, support_seed=0, imbalance=0.0,
+        )
+        assert ep.n_replaced_classes == 4
+        assert len(ep.query_y) == 120
+        ok = make_ep(imbalance=0.0)
+        assert ok.n_replaced_classes == 0
 
     def test_support_no_overlap_in_single_episode(self):
         """No index used twice in support."""
@@ -332,11 +370,31 @@ class TestMethods:
 
     def test_tim_lam0_equals_ce_only(self):
         """TIM with lam=0 should behave like CE-only (no MI term)."""
+        import torch
+        import torch.nn.functional as F
+
         ep = make_ep(shots=5, n_classes=4, dim=32)
-        preds_lam0 = predict_tim(ep, tau=20.0, lam=0.0, alpha=1.0, steps=50)
-        preds_cond = predict_tim_cond(ep, tau=20.0, lam=0.0, alpha=1.0, steps=50)
-        # Both are CE-only at lam=0; should produce same predictions
-        np.testing.assert_array_equal(preds_lam0, preds_cond)
+        tau, steps, lr = 20.0, 50, 1e-2
+
+        # Independent CE-only reference: support cross-entropy, nothing else.
+        zs = torch.tensor(ep.support_X)
+        ys = torch.tensor(ep.support_y)
+        zq = torch.tensor(ep.query_X)
+        P = torch.stack([zs[ys == c].mean(0) for c in range(4)]).clone().requires_grad_(True)
+        opt = torch.optim.Adam([P], lr=lr)
+        for _ in range(steps):
+            loss = F.cross_entropy(tau * zs @ F.normalize(P, dim=1).T, ys)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        ref = (zq @ F.normalize(P.detach(), dim=1).T).argmax(1).numpy()
+
+        np.testing.assert_array_equal(
+            predict_tim(ep, tau=tau, lam=0.0, alpha=1.0, steps=steps, lr=lr), ref
+        )
+        np.testing.assert_array_equal(
+            predict_tim_cond(ep, tau=tau, lam=0.0, alpha=1.0, steps=steps, lr=lr), ref
+        )
 
     def test_logreg_returns_valid_labels(self):
         ep = make_ep(shots=5, n_classes=4, dim=32)
@@ -356,6 +414,19 @@ class TestMethods:
         assert len(preds) == len(ep.query_y)
         assert preds[0] in range(4)
         assert len(set(preds)) == 1  # all same class
+
+    def test_majority_uses_query_distribution(self):
+        """Majority = most frequent class of the query set (spec), not of the balanced support."""
+        ep = make_ep(shots=5, n_classes=4, dim=32)
+        query_y = np.array([2, 2, 2, 1, 0], dtype=np.int64)
+        ep = Episode(
+            support_X=ep.support_X, support_y=ep.support_y,
+            query_X=np.zeros((5, 32), dtype=np.float32), query_y=query_y,
+            n_classes=4, pool_indices=ep.pool_indices, query_indices=np.arange(5),
+        )
+        preds = predict_majority(ep)
+        assert (preds == 2).all()
+        assert abs(compute_metrics(query_y, preds, n_classes=4)["acc"] - 0.6) < 1e-9
 
 
 # ---------------------------------------------------------------------------
@@ -393,13 +464,23 @@ class TestRunExperimentsSafety:
             f"stdout: {result.stdout}\nstderr: {result.stderr}"
         )
 
-    def test_smoke_mode_completes(self, tmp_path):
-        """--smoke must complete without error."""
+    def test_smoke_mode_completes_and_is_isolated(self, tmp_path):
+        """--smoke must complete and must not write to the real features/ or configs/."""
+        repo_root = Path(__file__).parent.parent
+
+        def snapshot() -> dict:
+            out = {}
+            for d in ("features", "configs", "results"):
+                for p in (repo_root / d).glob("*"):
+                    out[str(p)] = p.stat().st_mtime_ns
+            return out
+
+        before = snapshot()
         env = os.environ.copy()
-        env["PYTHONPATH"] = str(Path(__file__).parent.parent)
+        env["PYTHONPATH"] = str(repo_root)
         result = subprocess.run(
-            [sys.executable, "run_experiments.py", "--smoke"],
-            cwd=str(Path(__file__).parent.parent),
+            [sys.executable, "run_experiments.py", "--smoke", "--smoke-dir", str(tmp_path)],
+            cwd=str(repo_root),
             capture_output=True,
             text=True,
             env=env,
@@ -408,14 +489,78 @@ class TestRunExperimentsSafety:
         assert result.returncode == 0, (
             f"Smoke run failed:\n{result.stdout}\n{result.stderr}"
         )
+        assert (tmp_path / "results" / "smoke_results.csv").exists()
+        assert (tmp_path / "features").is_dir()
+        assert snapshot() == before, "smoke run modified real features/, configs/ or results/"
 
-    def test_tune_never_opens_test_split(self):
-        """Verify that tune.py only loads val/pool splits, not test."""
-        tune_source = (Path(__file__).parent.parent / "tune.py").read_text()
-        import re
-        # Check that load_features is not called with "test" as split arg
-        calls = re.findall(r'load_features\([^)]*\)', tune_source)
-        for call in calls:
-            assert "test" not in call, (
-                f"tune.py must not load test features, found: {call}"
-            )
+    def test_final_refuses_smoke_hparams(self, tmp_path):
+        """--final must refuse a best_hparams.json written by a smoke run."""
+        import shutil
+        repo_root = Path(__file__).parent.parent
+        for fname in ["run_experiments.py", "fewshot.py"]:
+            shutil.copy(repo_root / fname, tmp_path / fname)
+        (tmp_path / "configs").mkdir()
+        (tmp_path / "configs" / "best_hparams.json").write_text(
+            json.dumps({"dataset": "bloodmnist", "timestamp": "smoke", "encoders": {"x": {}}})
+        )
+        result = subprocess.run(
+            [sys.executable, str(tmp_path / "run_experiments.py"), "--final"],
+            cwd=str(tmp_path), capture_output=True, text=True,
+        )
+        assert result.returncode != 0
+        assert "smoke" in (result.stdout + result.stderr)
+
+    def test_tune_loader_refuses_test_split(self):
+        import tune
+        with pytest.raises(ValueError, match="test"):
+            tune.load_features("bloodmnist", "resnet50", "test")
+
+    def test_tune_never_opens_test_split(self, tmp_path, monkeypatch):
+        """Run the real tuning path on synthetic features; record every file it loads."""
+        import run_experiments
+        import tune
+
+        run_experiments.make_smoke_features("bloodmnist", ["resnet50"], tmp_path / "features")
+        opened: list[str] = []
+        real_load = np.load
+
+        def spy_load(path, *a, **kw):
+            opened.append(str(path))
+            return real_load(path, *a, **kw)
+
+        monkeypatch.setattr(tune.np, "load", spy_load)
+        monkeypatch.setattr(sys, "argv", [
+            "tune.py", "--smoke", "--encoders", "resnet50", "--shots", "1",
+            "--feature-dir", str(tmp_path / "features"),
+            "--config-dir", str(tmp_path / "configs"),
+        ])
+        tune.main()
+
+        names = [Path(p).name for p in opened]  # tmp dir name itself contains "test"
+        assert names, "tune.py loaded no features"
+        assert all(("_pool_" in n or "_val_" in n) for n in names), names
+        assert not any("_test_" in n for n in names), names
+        hp = json.loads((tmp_path / "configs" / "best_hparams.json").read_text())
+        assert hp["smoke"] is True  # so --final would refuse it
+
+    def test_results_csv_refuses_duplicates(self, tmp_path):
+        import run_experiments as rx
+
+        csv_path = tmp_path / "r.csv"
+        row = {"dataset": "d", "encoder": "e", "method": "proto", "shots": 1,
+               "imbalance": 0.0, "episode": 0, "split": "test", "n_query": 1,
+               "acc": 1.0, "macro_f1": 1.0, "bal_acc": 1.0}
+        other = {**row, "episode": 1}
+        import csv as _csv
+        with open(csv_path, "w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=rx.CSV_COLUMNS)
+            w.writeheader()
+            w.writerows([row, other])
+
+        planned = {rx.row_key(row)}
+        with pytest.raises(SystemExit):
+            rx.prepare_csv(csv_path, planned, force=False)
+        rx.prepare_csv(csv_path, planned, force=True)
+        kept = rx.read_existing_rows(csv_path)
+        assert [rx.row_key(r) for r in kept] == [rx.row_key(other)]
+        rx.prepare_csv(csv_path, {("d", "e", "tim", 1, 0.0, 0)}, force=False)  # no clash: ok

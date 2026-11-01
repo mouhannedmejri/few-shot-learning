@@ -31,6 +31,7 @@ class Episode:
     n_classes: int
     pool_indices: np.ndarray   # which pool rows were used as support
     query_indices: np.ndarray  # which split rows were used as query
+    n_replaced_classes: int = 0  # classes drawn with replace=True (too few images)
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +100,7 @@ def sample_episode(
 
     # --- Query sampling per class ---
     qry_idx_list: list[int] = []
+    n_replaced_classes = 0
     for c in range(n_classes):
         class_q_idx = np.where(query_y == c)[0]
         needed = int(counts[c])
@@ -110,6 +112,7 @@ def sample_episode(
                 c, needed, len(class_q_idx),
             )
             chosen = qry_rng.choice(class_q_idx, needed, replace=True)
+            n_replaced_classes += 1
         else:
             chosen = qry_rng.choice(class_q_idx, needed, replace=False)
         qry_idx_list.extend(chosen.tolist())
@@ -127,6 +130,7 @@ def sample_episode(
         n_classes=n_classes,
         pool_indices=pool_indices,
         query_indices=query_indices,
+        n_replaced_classes=n_replaced_classes,
     )
 
 
@@ -270,8 +274,12 @@ def predict_random(ep: Episode, *, rng_seed: int = 42) -> np.ndarray:
 
 
 def predict_majority(ep: Episode) -> np.ndarray:
-    """Predict the most frequent class in the support set (fair: no query leakage)."""
-    classes, counts = np.unique(ep.support_y, return_counts=True)
+    """Predict the most frequent class of the query set (oracle sanity baseline).
+
+    Uses query labels by design: it is a reference row, not a method.
+    Ties go to the smallest class index.
+    """
+    classes, counts = np.unique(ep.query_y, return_counts=True)
     maj_class = int(classes[counts.argmax()])
     return np.full(len(ep.query_y), maj_class, dtype=np.int64)
 

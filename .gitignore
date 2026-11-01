@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+
+# smoke-mode outputs (synthetic, never real results)
+smoke/
+
+# large extracted features; pool indices are small and kept
+features/*_X.npy
+features/*_Y.npy

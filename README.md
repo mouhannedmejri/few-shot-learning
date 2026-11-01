@@ -33,7 +33,7 @@ python run_experiments.py --dataset bloodmnist --final --episodes 300
 python make_plots.py
 
 # Smoke test (synthetic features, finishes in seconds)
-python run_experiments.py --smoke
+python run_experiments.py --smoke   # writes only to smoke/ (gitignored)
 
 # Run all unit tests
 pytest -q
@@ -77,7 +77,7 @@ Features are L2-normalised (float32) before saving.
 | `tim` | TIM-style: prototypes optimised via CE − λ(H(Y) − αH(Y\|X)); tune τ,λ,α on val |
 | `tim_cond` | ablation: CE + λαH(Y\|X) only (no marginal entropy term) |
 | `random` | uniform random baseline |
-| `majority` | support-set majority class baseline |
+| `majority` | predicts the most frequent class of each query set (oracle sanity row, uses query labels) |
 
 ### Hyperparameter Tuning
 - 100 val episodes per (encoder, shots); balanced queries only.

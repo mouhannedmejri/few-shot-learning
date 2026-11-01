@@ -17,9 +17,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import os
+import shutil
 import time
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -218,26 +221,89 @@ def main() -> None:
     info = INFO[args.dataset]
     n_classes = len(info["label"])
     DataClass = getattr(medmnist, info["python_class"])
-    logger.info("Dataset: %s, classes: %d", args.dataset, n_classes)
+    logger.info("Dataset: %s, classes: %d, size: %d", args.dataset, n_classes, args.size)
+    check_download(info, args.dataset, args.size, medmnist.info.DEFAULT_ROOT)
 
-    # Check download size hint
-    logger.info("Loading %s size=%d (train split) ...", args.dataset, args.size)
-    train_data = DataClass(split="train", size=args.size, download=True, as_rgb=True)
-    val_data = DataClass(split="val", size=args.size, download=True, as_rgb=True)
-    test_data = DataClass(split="test", size=args.size, download=True, as_rgb=True)
+    # Which (split, encoder) files are still missing? Only those splits get loaded.
+    todo = {
+        split: [
+            enc for enc in args.encoders
+            if args.force or not (FEATURE_DIR / f"{args.dataset}_{enc}_{split}_X.npy").exists()
+        ]
+        for split in ("pool", "val", "test")
+    }
 
-    train_imgs = train_data.imgs  # (N, H, W, C) uint8
-    train_labels = train_data.labels
-    val_imgs = val_data.imgs
-    val_labels = val_data.labels
-    test_imgs = test_data.imgs
-    test_labels = test_data.labels
+    # One split in memory at a time; from train only the pool rows are kept.
+    for split_name, encoders in todo.items():
+        if not encoders:
+            logger.info("[%s] all requested encoders already extracted, skipping.", split_name)
+            continue
+        if split_name == "pool":
+            imgs, labels = load_pool(DataClass, args, n_classes)
+        else:
+            imgs, labels = load_split(DataClass, split_name, args.size)
+        logger.info(
+            "[%s] %d images, class counts %s", split_name, len(labels),
+            np.bincount(labels, minlength=n_classes).tolist(),
+        )
+        for enc_key in encoders:
+            prefix = FEATURE_DIR / f"{args.dataset}_{enc_key}_{split_name}"
+            model, tfm, feat_dim = load_encoder(enc_key, device)
+            t0 = time.time()
+            dset = MedMNISTFeatureDataset(imgs, labels, tfm)
+            feats = extract_features(model, enc_key, dset, args.batch_size, device)
+            norms = np.linalg.norm(feats, axis=1)
+            if feats.shape[1] != feat_dim or not np.allclose(norms, 1.0, atol=1e-3):
+                raise RuntimeError(
+                    f"[{enc_key}] {split_name}: bad features shape={feats.shape} "
+                    f"norm range=({norms.min():.4f}, {norms.max():.4f})"
+                )
+            np.save(f"{prefix}_X.npy", feats)
+            np.save(f"{prefix}_Y.npy", labels)
+            logger.info(
+                "[%s] %s: shape=%s, norm min/max=%.4f/%.4f, %.1f s (%.1f img/s)",
+                enc_key, split_name, feats.shape, norms.min(), norms.max(),
+                time.time() - t0, len(labels) / max(time.time() - t0, 1e-9),
+            )
+            del model
+        del imgs, labels
+        gc.collect()
 
-    logger.info(
-        "Splits: train=%d, val=%d, test=%d", len(train_imgs), len(val_imgs), len(test_imgs)
-    )
 
-    # --- Pool indices (shared across encoders) ---
+def check_download(info: dict, dataset: str, size: int, root: str) -> None:
+    """Log the download size and refuse to start if free disk is too small."""
+    size_flag = "" if size == 28 else f"_{size}"
+    local = Path(root) / f"{dataset}{size_flag}.npz"
+    if local.exists():
+        logger.info("Dataset file already present: %s (%.0f MB)", local, local.stat().st_size / 1e6)
+        return
+    url = info["url" if size == 28 else f"url_{size}"]
+    req = urllib.request.Request(url, method="HEAD")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            n_bytes = int(resp.headers.get("Content-Length", 0))
+    except OSError as e:
+        logger.warning("Could not read download size (%s); continuing.", e)
+        return
+    free = shutil.disk_usage(root).free
+    logger.info("Download size: %.0f MB; free disk at %s: %.0f MB", n_bytes / 1e6, root, free / 1e6)
+    if n_bytes and free < n_bytes * 1.5:
+        raise SystemExit(
+            f"Not enough disk for {dataset} size={size}: need ~{n_bytes * 1.5 / 1e6:.0f} MB. "
+            "Free space or use --size 128."
+        )
+
+
+def load_split(DataClass, split: str, size: int) -> tuple[np.ndarray, np.ndarray]:
+    """Load one MedMNIST split as (uint8 images, int64 labels)."""
+    data = DataClass(split=split, size=size, download=True, as_rgb=True, mmap_mode="r")
+    return data.imgs, data.labels.squeeze().astype(np.int64)
+
+
+def load_pool(DataClass, args: argparse.Namespace, n_classes: int) -> tuple[np.ndarray, np.ndarray]:
+    """Load train, keep only the fixed-seed pool rows, and free the rest."""
+    train_imgs, train_labels = load_split(DataClass, "train", args.size)
+    logger.info("[train] %d images (only the pool is kept)", len(train_labels))
     pool_idx_path = FEATURE_DIR / f"{args.dataset}_pool_idx.npy"
     if pool_idx_path.exists() and not args.force:
         pool_idx = np.load(pool_idx_path)
@@ -246,59 +312,18 @@ def main() -> None:
         pool_idx = build_pool_indices(train_labels, n_classes, args.pool_per_class, args.pool_seed)
         np.save(pool_idx_path, pool_idx)
         logger.info("Saved pool indices: %d total (%d classes)", len(pool_idx), n_classes)
-
-    pool_imgs = train_imgs[pool_idx]
+    pool_imgs = np.ascontiguousarray(train_imgs[pool_idx])
     pool_labels = train_labels[pool_idx]
-
-    # --- Extract per encoder ---
-    for enc_key in args.encoders:
-        prefix = f"{args.dataset}_{enc_key}"
-        paths = {
-            "pool_X": FEATURE_DIR / f"{prefix}_pool_X.npy",
-            "pool_Y": FEATURE_DIR / f"{prefix}_pool_Y.npy",
-            "val_X": FEATURE_DIR / f"{prefix}_val_X.npy",
-            "val_Y": FEATURE_DIR / f"{prefix}_val_Y.npy",
-            "test_X": FEATURE_DIR / f"{prefix}_test_X.npy",
-            "test_Y": FEATURE_DIR / f"{prefix}_test_Y.npy",
-        }
-        if all(p.exists() for p in paths.values()) and not args.force:
-            logger.info("[%s] All feature files exist, skipping (use --force to re-extract).", enc_key)
-            continue
-
-        logger.info("[%s] Loading encoder ...", enc_key)
-        model, tfm, feat_dim = load_encoder(enc_key, device)
-        logger.info("[%s] Feature dim: %d", enc_key, feat_dim)
-
-        t0 = time.time()
-        for split_name, imgs, labels in [
-            ("pool", pool_imgs, pool_labels),
-            ("val", val_imgs, val_labels),
-            ("test", test_imgs, test_labels),
-        ]:
-            x_path = FEATURE_DIR / f"{prefix}_{split_name}_X.npy"
-            y_path = FEATURE_DIR / f"{prefix}_{split_name}_Y.npy"
-            if x_path.exists() and not args.force:
-                logger.info("[%s] %s already extracted, skipping.", enc_key, split_name)
-                continue
-            dset = MedMNISTFeatureDataset(imgs, labels, tfm)
-            feats = extract_features(model, enc_key, dset, args.batch_size, device)
-            lbls = labels.squeeze().astype(np.int64)
-            np.save(x_path, feats)
-            np.save(y_path, lbls)
-            logger.info(
-                "[%s] %s: shape=%s, norm_mean=%.4f",
-                enc_key, split_name, feats.shape,
-                np.linalg.norm(feats, axis=1).mean(),
-            )
-        elapsed = time.time() - t0
-        logger.info("[%s] Done in %.1f s.", enc_key, elapsed)
-        del model
+    del train_imgs, train_labels
+    gc.collect()
+    return pool_imgs, pool_labels
 
 
 def _run_smoke(args: argparse.Namespace) -> None:
     """Write tiny synthetic feature files for testing."""
-    logger.info("[smoke] Writing synthetic feature files ...")
-    FEATURE_DIR.mkdir(exist_ok=True)
+    smoke_dir = Path("smoke") / "features"  # never the real features/ dir
+    logger.info("[smoke] Writing synthetic feature files to %s ...", smoke_dir)
+    smoke_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(0)
     n_classes = 8
     D = 64
@@ -309,10 +334,10 @@ def _run_smoke(args: argparse.Namespace) -> None:
             X = rng.standard_normal((n, D)).astype(np.float32)
             X = X / np.linalg.norm(X, axis=1, keepdims=True)
             Y = np.repeat(np.arange(n_classes), n_per_class).astype(np.int64)
-            np.save(FEATURE_DIR / f"{prefix}_{split_name}_X.npy", X)
-            np.save(FEATURE_DIR / f"{prefix}_{split_name}_Y.npy", Y)
+            np.save(smoke_dir / f"{prefix}_{split_name}_X.npy", X)
+            np.save(smoke_dir / f"{prefix}_{split_name}_Y.npy", Y)
     pool_idx = np.arange(50 * n_classes, dtype=np.int64)
-    np.save(FEATURE_DIR / f"{args.dataset}_pool_idx.npy", pool_idx)
+    np.save(smoke_dir / f"{args.dataset}_pool_idx.npy", pool_idx)
     logger.info("[smoke] Done.")
 
 

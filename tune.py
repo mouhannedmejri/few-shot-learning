@@ -44,9 +44,14 @@ C_REG_GRID = [0.01, 0.1, 1.0, 10.0, 100.0]
 SHOTS_LIST = [1, 5, 10, 20]
 
 
-def load_features(dataset: str, encoder: str, split: str):
-    """Load (X, Y) npy pair for given dataset/encoder/split."""
-    prefix = FEATURE_DIR / f"{dataset}_{encoder}"
+TUNING_SPLITS = ("pool", "val")
+
+
+def load_features(dataset: str, encoder: str, split: str, feature_dir: Path = FEATURE_DIR):
+    """Load (X, Y) npy pair for given dataset/encoder/split. Refuses the test split."""
+    if split not in TUNING_SPLITS:
+        raise ValueError(f"tune.py may only load {TUNING_SPLITS}, not {split!r} (test leakage)")
+    prefix = feature_dir / f"{dataset}_{encoder}"
     X = np.load(f"{prefix}_{split}_X.npy")
     Y = np.load(f"{prefix}_{split}_Y.npy")
     return X, Y
@@ -132,21 +137,23 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--shots", nargs="+", type=int, default=SHOTS_LIST)
     parser.add_argument("--base-seed", type=int, default=1000)
+    parser.add_argument("--feature-dir", default=str(FEATURE_DIR))
+    parser.add_argument("--config-dir", default=str(CONFIG_DIR))
     parser.add_argument(
         "--smoke", action="store_true",
         help="Run 2 episodes per config for quick validation."
     )
     args = parser.parse_args()
 
-    # Never touch test split
-    assert "test" not in str(FEATURE_DIR), "tune.py must not open test files"
-
-    CONFIG_DIR.mkdir(exist_ok=True)
+    feature_dir = Path(args.feature_dir)
+    config_dir = Path(args.config_dir)
+    config_dir.mkdir(parents=True, exist_ok=True)
     n_eps = 2 if args.smoke else args.episodes
 
     best: dict = {
         "dataset": args.dataset,
         "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        "smoke": args.smoke,
         "n_val_episodes": n_eps,
         "val_support_base_seed": args.base_seed,
         "encoders": {},
@@ -155,8 +162,8 @@ def main() -> None:
     for enc_key in args.encoders:
         logger.info("=== Encoder: %s ===", enc_key)
         try:
-            pool_X, pool_y = load_features(args.dataset, enc_key, "pool")
-            val_X, val_y = load_features(args.dataset, enc_key, "val")
+            pool_X, pool_y = load_features(args.dataset, enc_key, "pool", feature_dir)
+            val_X, val_y = load_features(args.dataset, enc_key, "val", feature_dir)
         except FileNotFoundError as e:
             logger.error("Feature files not found: %s. Run extract_features.py first.", e)
             continue
@@ -193,7 +200,7 @@ def main() -> None:
             }
         best["encoders"][enc_key] = enc_best
 
-    out_path = CONFIG_DIR / "best_hparams.json"
+    out_path = config_dir / "best_hparams.json"
     with open(out_path, "w") as f:
         json.dump(best, f, indent=2)
     logger.info("Saved hyperparameters to %s", out_path)
