@@ -1,0 +1,13 @@
+{
+  "0": "test_fewshot.py",
+  "1": "run_experiments.py",
+  "2": "numpy",
+  "3": "few-shot-medical-transductive",
+  "4": "extract_features.py",
+  "5": "CLAUDE.md — few-shot-medical-transductive",
+  "6": "make_ep",
+  "7": "compute_metrics",
+  "8": "TestRunExperimentsSafety",
+  "9": ".claude/CLAUDE.md",
+  "10": "__init__.py"
+}
