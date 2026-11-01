@@ -168,6 +168,9 @@ def run_experiment(
     if write_header:
         writer.writeheader()
 
+    # Summed confusion matrices over balanced episodes, keyed "{encoder}_{shots}shot_{method}"
+    confusion: dict[str, np.ndarray] = {}
+
     try:
         for enc_key in encoders:
             logger.info("=== Encoder: %s ===", enc_key)
@@ -229,6 +232,11 @@ def run_experiment(
                                 "bal_acc": round(m["bal_acc"], 6),
                             }
                             writer.writerow(row)
+                            if imbalance == 0.0:
+                                key = f"{enc_key}_{shots}shot_{method}"
+                                cm = confusion.get(key, np.zeros((n_classes, n_classes), dtype=np.int64))
+                                np.add.at(cm, (ep.query_y, preds), 1)
+                                confusion[key] = cm
 
                     csv_file.flush()
                     elapsed = time.time() - t0
@@ -237,6 +245,11 @@ def run_experiment(
                     )
     finally:
         csv_file.close()
+
+    if confusion:
+        cm_path = csv_path.parent / "confusion_matrices.npz"
+        np.savez(cm_path, **confusion)
+        logger.info("Saved %d balanced-episode confusion matrices to %s", len(confusion), cm_path)
 
 
 def make_smoke_features(dataset: str, encoders: list[str], feature_dir: Path) -> None:

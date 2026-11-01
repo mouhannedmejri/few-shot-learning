@@ -493,6 +493,15 @@ class TestRunExperimentsSafety:
         assert (tmp_path / "features").is_dir()
         assert snapshot() == before, "smoke run modified real features/, configs/ or results/"
 
+        # Balanced episodes leave summed confusion matrices next to the CSV (Fig 4 input)
+        cms = np.load(tmp_path / "results" / "confusion_matrices.npz")
+        assert "resnet50_5shot_tim" in cms.files and "resnet50_5shot_proto" in cms.files
+        for key in cms.files:
+            cm = cms[key]
+            n_classes = cm.shape[0]
+            assert cm.shape == (n_classes, n_classes)
+            assert cm.sum() == 2 * n_classes * 30  # 2 smoke episodes x balanced C*30 queries
+
     def test_final_refuses_smoke_hparams(self, tmp_path):
         """--final must refuse a best_hparams.json written by a smoke run."""
         import shutil

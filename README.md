@@ -86,6 +86,8 @@ Features are L2-normalised (float32) before saving.
   edge values in nearly every setting. Still val-only; the grid used is stored in `best_hparams.json`.
 - Frozen in `configs/best_hparams.json` before any test evaluation.
 - Hyperparameters tuned on balanced val are used for all imbalance levels (realistic deployment).
+- `tim_cond` is not tuned separately: it reuses TIM's τ, λ, α per (encoder, shots), so the
+  ablation differs from `tim` only by the removed marginal-entropy term.
 
 ### Metrics
 - Accuracy, macro-F1, balanced accuracy.
