@@ -55,7 +55,8 @@ def make_table_a(df: pd.DataFrame) -> str:
         .rename(columns={"mean": "acc_mean", "ci95_series": "acc_ci95"})
         .reset_index()
     )
-    lines = ["## Table A — Accuracy by Encoder × Method × Shots (balanced queries)\n"]
+    splits = ", ".join(sorted(bal["split"].astype(str).unique())) or "none"
+    lines = [f"## Table A — Accuracy by Encoder × Method × Shots (balanced queries, split: {splits})\n"]
     lines.append("| encoder | method | shots=1 | shots=5 | shots=10 | shots=20 |")
     lines.append("|---|---|---|---|---|---|")
     for (enc, method), sub in grouped.groupby(["encoder", "method"]):
